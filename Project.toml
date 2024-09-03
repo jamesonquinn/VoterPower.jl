@@ -3,6 +3,11 @@ uuid = "5a02bda8-42a6-43fc-8380-228f067fcd18"
 authors = ["jamesonquinn <jameson.quinn@gmail.com> and contributors"]
 version = "1.0.0-DEV"
 
+[deps]
+Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+Maybe = "334f122f-1118-46cc-837f-bff747ee6f78"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+
 [compat]
 julia = "1.6.7"
 
