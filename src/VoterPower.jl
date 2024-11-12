@@ -2,6 +2,10 @@ module VoterPower
 
 using Random
 using Maybe
+using Distributions
+
+#plotting
+using Plots
 
 abstract type AbstractBallot end
 
@@ -11,6 +15,11 @@ end
 
 struct InvertedPreferenceBallot <: AbstractBallot
     model::PreferenceBallot
+end
+
+struct OneInversionPreferenceBallot <: AbstractBallot
+    model::PreferenceBallot
+    cand_to_invert::Int
 end
 
 abstract type AbstractElection end
@@ -25,14 +34,40 @@ struct ElectionWithMirrors <: AbstractElection
     inversions::Vector{Bool}
 end
 
-struct STV_round_record
+struct ElectionOneMirror <: AbstractElection
+    model::Election
+    inversions::Vector{Bool}
+    cand_to_invert::Int
+end
+
+abstract type ElectionModifier end
+
+mutable struct PermMirrors <: ElectionModifier
+    perm::Vector{Int} # permutation of the voters. Just make sure the length is right.
+    how_deep::Int # how many voters into the permutation to mirror. 0 means no mirroring.
+    index_of_first_unmirrored::Int # the index of the first umirrored voter, or -1. If found, perm(index_of_first_unmirrored) == how_deep + 1.
+end
+
+# mutable struct ElectionGlass <: AbstractElection # "Glass" because it's through some arbitrary looking glass
+#     model::Election
+#     glass::ElectionModifier
+# end
+#
+# ...but no, we want that type to be parametrized by the glass type, for efficient dispatch.
+
+mutable struct ElectionGlass{G<:ElectionModifier} <: AbstractElection
+    model::AbstractElection
+    glass::G
+end
+
+mutable struct STV_round_record
     initial_survivors::BitVector #Technically this is redundant, but it avoids recalculating.
     initial_tallies::Vector{Float64} #copy of the weighted_tallies at the beginning of the round
     winner_found::Bool #whether a winner was found in this round
     reallocated_cand::Int #the id of the candidate who was reallocated in this round
 end
 
-struct STV_record 
+mutable struct STV_record 
     n_winners::Int
     n_voters::Int
     n_candidates::Int
@@ -40,9 +75,87 @@ struct STV_record
     winners::Vector{Int}
 end
 
-function STV_result(election::Election, n_winners::Int;
+abstract type AbstractVoter end # Used for both voters and candidates
+
+struct SpatialVoter <: AbstractVoter
+    location::Vector{Float64}
+    weights::Vector{Float64} # Diagonal of precision matrix for the voter's mahalanobis distance metric
+    label::Any # eg, cluster id — for things like graphing.
+end
+
+struct Electorate #Technically we should specialize on voter type, but this is fine for now.
+    voters::Vector{AbstractVoter}
+    candidates::Vector{AbstractVoter}
+end
+
+## Functions for converting from electorate to election
+
+function rate_candidate(voter::SpatialVoter, candidate::SpatialVoter)
+    return exp(-0.5 * sum((voter.location - candidate.location).^2 .* voter.weights.^2))
+        # Compare candidate ratings to get a preference ballot
+        # Note the exp; this is a Gaussian kernel, so for ratings ballots, two faraway candidates will be rated similarly.
+end
+
+function get_ballot(voter::AbstractVoter, candidates::Vector{AbstractVoter})
+    ratings = [rate_candidate(voter, candidate) for candidate in candidates]
+    return PreferenceBallot(sortperm(ratings, rev=true))
+end
+
+function get_election(electorate::Electorate)
+    n_candidates = length(electorate.candidates)
+    ballots = [get_ballot(voter, electorate.candidates) for voter in electorate.voters]
+    return Election(n_candidates, ballots)
+end
+
+## Counting voters
+function count_voters(election::Election)
+    return length(election.ballots)
+end
+
+function count_voters(election::ElectionWithMirrors)
+    return count_voters(election.model)
+end
+
+function count_voters(election::ElectionOneMirror)
+    return count_voters(election.model)
+end
+
+function count_voters(election::ElectionGlass)
+    return count_voters(election.model)
+end
+
+function count_candidates(election::Election)
+    return election.n_candidates
+end
+
+function count_candidates(election::ElectionWithMirrors)
+    return count_candidates(election.model)
+end
+
+function count_candidates(election::ElectionOneMirror)
+    return count_candidates(election.model)
+end
+
+function count_candidates(election::ElectionGlass)
+    return count_candidates(election.model)
+end
+
+## Functions for the STV algorithm
+
+function STV_record()
+    return STV_record(0, 0, 0, [], []) #fill in the fields later
+end
+
+function STV_result(election::AbstractElection, n_winners::Int;
         assert_invariants::Bool=false,
-        record::Union{STV_record, Nothing}=nothing)
+        record::Union{STV_record, Nothing}=nothing;
+
+        # Optional arguments for efficiency
+        deindexify::Union{Function, Nothing}=nothing,
+        indexify::Union{Function, Nothing}=nothing,
+        # Optional arguments for additional outputs
+        white_box_power::Union{Matrix{Float64}, Nothing}=nothing,
+        distance_from_pivotality::Union{Vector{Float64}, Nothing}=nothing)
 """
     Run the Single Transferable Vote (STV) algorithm on an election.
 
@@ -58,8 +171,8 @@ function STV_result(election::Election, n_winners::Int;
         record: A STV_record object to record the results of the election. If nothing, don't record.
             The record includes the number of winners, the number of voters, the number of candidates, the rounds of the election, and the winners.
 """
-    n_voters = length(election.ballots)
-    n_candidates = election.n_candidates * 2 # Each candidate has a mirror anti-candidate. 
+    n_voters = count_voters(election)
+    n_candidates = count_candidates(election) * 2 # Each candidate has a mirror anti-candidate. 
         # The anti-candidate is the candidate with the same index, but with a negative sign.
         # If you're running a normal election, the anti-candidates will never win, so you can ignore them.
 
@@ -68,18 +181,44 @@ function STV_result(election::Election, n_winners::Int;
     winners = zeros(Int, n_winners) # Zero is not a valid candidate index, even though negative indices are valid anti-candidates
     winners_so_far = 0
     round = 1
-    ballot_piles = zeros(Int, [n_candidates, n_voters])
+    ballot_piles = zeros(Int, n_candidates, n_voters)
     ballot_pile_sizes = zeros(Int, n_candidates)
     weighted_tallies = zeros(Float64, n_candidates)
     ballot_weights = ones(Float64, n_voters)
 
+    if record != nothing
+        record.n_winners = n_winners
+        record.n_voters = n_voters
+        record.n_candidates = n_candidates
+        record.rounds = []
+        record.winners = []
+    end
+
     # Call the mutating version of the function
     return STV_result_inner!(election, n_winners, surviving_candidates, winners, 
             winners_so_far, round, ballot_piles, ballot_pile_sizes, weighted_tallies, ballot_weights;
-            assert_invariants=assert_invariants, record=record)
+            assert_invariants=assert_invariants, record=record,
+            deindexify=deindexify, indexify=indexify, white_box_power=white_box_power,
+            distance_from_pivotality=distance_from_pivotality)
 end
 
-function STV_result_inner!(election::Election, 
+function get_deindexify(deindexify::Function, n_candidates::Int)
+    return deindexifyi
+end
+
+function get_deindexify(deindexify::Nothing, n_candidates::Int)
+    return cand_index_to_id(n_candidates)
+end
+
+function get_indexify(indexify::Function, n_candidates::Int)
+    return indexify
+end
+
+function get_indexify(indexify::Nothing, n_candidates::Int)
+    return cand_id_to_index(n_candidates)
+end
+
+function STV_result_inner!(election::AbstractElection, 
                 n_winners::Int, 
                 surviving_candidates::BitVector, 
                 winners::Vector{Int}, 
@@ -91,7 +230,12 @@ function STV_result_inner!(election::Election,
                 ballot_weights::Vector{Float64};
 
                 assert_invariants::Bool=false,
-                record::Union{STV_record, Nothing}=nothing)
+                record::Union{STV_record, Nothing}=nothing,
+                deindexify::Union{Function, Nothing}=nothing,
+                indexify::Union{Function, Nothing}=nothing,
+                white_box_power::Union{Matrix{Float64}, Nothing}=nothing,
+                distance_from_pivotality::Union{Vector{Float64}, Nothing}=nothing,
+                )
 """
     Run the Single Transferable Vote (STV) algorithm on an election.
 
@@ -136,6 +280,21 @@ function STV_result_inner!(election::Election,
 
 
 """
+    #OK, let's think a bit about possible additional outputs.
+    #These should be via optional mutable arguments, of course. Testing to see if arg is nothing is cheap.
+    #1. Empirical ("white-box") power matrix. This is a matrix of the power of each voter to elect each winner.
+    #   Dimensions: n_winners x n_voters. This is a measure of the power of each voter to elect each winner.
+    
+    #2. Distance from pivotality. The smallest margin by which any branch was taken. Flipping fewer than half this
+    #  number of voters could not have changed the outcome. This is a measure of the robustness of the outcome, useful
+    #  for speeding up binary search. (This is the simplest output that avoids at least some re-runs as we flip voters.
+    #  There may be other ways to reduce redundancy, but they'd be way more complex.)
+
+    #3. A record of the steps, in a form that allows evaluating whether any pair of ballots is "equivalently pivotal".
+    #   This is already covered by STV_record, though it may be less than perfectly efficient.
+
+    #... OK, let's add 1-2 then.
+
     
     # record global params
     if record != nothing
@@ -146,20 +305,25 @@ function STV_result_inner!(election::Election,
         record.winners = winners
     end
 
+    if distance_from_pivotality != nothing
+        distance_from_pivotality[1] = Inf #initialize to infinity. It's really just a number; the Vector type is for mutability.
+    end
+
 
     # Calculate the Droop quota
-    n_voters = length(election.ballots)
+    n_voters = count_voters(election)
     quota = n_voters / (n_winners + 1) # technically this isn't the Droop quota because we're not adding epsilon, but for the invariants above this is actually better.
-    n_candidates = election.n_candidates * 2 # Each candidate has a mirror anti-candidate. 
+    n_candidates = count_candidates(election) * 2 # Each candidate has a mirror anti-candidate. 
         # The anti-candidate is the candidate with the same index, but with a negative sign.
         # If you're running a normal election, the anti-candidates will never win, so you can ignore them.
-    deindexify = cand_index_to_id(n_candidates) # Convert from candidate index (1 to n_candidates) to candidate id (-n_candidates/2 to n_candidates/2)
+    deindexify_ = get_deindexify(deindexify, n_candidates)#cand_index_to_id(n_candidates) # Convert from candidate index (1 to n_candidates) to candidate id (-n_candidates/2 to n_candidates/2)
         # candidate index has the anti-candidates after the candidates, in the same order.
-    indexify = cand_id_to_index(n_candidates) # Convert from candidate id (-n_candidates/2 to n_candidates/2) to candidate index (1 to n_candidates)
+    indexify_ = get_indexify(indexify, n_candidates) #cand_id_to_index(n_candidates) # Convert from candidate id (-n_candidates/2 to n_candidates/2) to candidate index (1 to n_candidates)
 
     do_initial_tallies!(election, n_winners, surviving_candidates, winners, winners_so_far, round, ballot_piles, ballot_pile_sizes, weighted_tallies, ballot_weights)
     # keep doing rounds until we have enough winners
     while winners_so_far < n_winners
+        print("Round $round\n; winners so far: $winners_so_far of $n_winners\n; surviving candidates: $(findall(surviving_candidates))\n; weighted tallies: $weighted_tallies\n; ballot pile sizes: $ballot_pile_sizes\n; quota = $quota\n\n")
 
         # Precondition assertion
         @assert round <= n_candidates
@@ -171,13 +335,23 @@ function STV_result_inner!(election::Election,
         end
 
         # Check if any candidate has more votes than the quota
-        if max(weighted_tallies[surviving_candidates]) >= quota
+        if maximum(weighted_tallies[surviving_candidates]) >= quota
+            if distance_from_pivotality != nothing
+                distance_from_pivotality[1] = minimum(distance_from_pivotality[1],
+                        maximum(weighted_tallies[surviving_candidates]) - quota)
+            end
                 # Note `>=` ... this means we won't have a tiebreaker if the last two candidates have exactly the quota. 
 
             # If so, elect the candidate with the most votes
             next_survivor = argmax(weighted_tallies[surviving_candidates]) # This gets the index of the winner *among the surviving candidates*.
-                # This is not the same as the candidate id or even the candidate index.
+                # This is not the same as the candidate id.
             next_winner_index = get_survivor_index(next_survivor, surviving_candidates, n_candidates)
+
+            if distance_from_pivotality != nothing
+                second_place_tally = maximum(weighted_tallies[surviving_candidates .& (1:n_candidates .!= next_survivor)])
+                distance_from_pivotality[1] = minimum(distance_from_pivotality[1],
+                        weighted_tallies[next_survivor] - second_place_tally)
+            end
             # next_winner_index = 0
             # for i in 1:n_candidates
             #     if surviving_candidates[i]
@@ -188,7 +362,7 @@ function STV_result_inner!(election::Election,
             #         end
             #     end
             # end
-            next_winner = deindexify(next_winner_index)
+            next_winner = deindexify_(next_winner_index)
 
             # Record the round
             if record != nothing
@@ -196,7 +370,17 @@ function STV_result_inner!(election::Election,
                 record.rounds[end].reallocated_cand = next_winner
             end
 
+            if white_box_power != nothing
+                white_box_power[winners_so_far + 1, :] = zeros(Float64, n_voters)
+                for ballot in 1:ballot_pile_sizes[next_winner_index]
+                    voter_num = ballot_piles[next_winner_index, ballot]
+                    white_box_power[winners_so_far + 1, voter_num] = ballot_weights[voter_num]
+                end
+                white_box_power[winners_so_far + 1, :] /= sum(white_box_power[winners_so_far + 1, :])
+            end
+
             winners[winners_so_far + 1] = next_winner
+            weighted_tallies[next_winner_index] = -quota # Once a candidate is elected, their tally is negative.
             winners_so_far += 1
             surviving_candidates[next_winner_index] = false
             # Transfer the surplus votes
@@ -205,23 +389,34 @@ function STV_result_inner!(election::Election,
             for i in 1:ballot_pile_sizes[next_winner_index]
                 voter_num = ballot_piles[next_winner_index, i]
                 ballot = get_ballot(election, voter_num)
-                new_pile = best_surviving_preference(ballot, surviving_candidates, n_candidates, indexify)
+                new_pile = best_surviving_preference(ballot, surviving_candidates, n_candidates, indexify_)
+                #print("voter $voter_num, ballot $ballot, new pile $new_pile\n")
                 if new_pile == 0
                     ballot_weights[voter_num] = 0.
                 else
                     ballot_piles[new_pile, ballot_pile_sizes[new_pile] + 1] = voter_num
                     ballot_pile_sizes[new_pile] += 1
                     ballot_weights[voter_num] *= weight_ratio
+                    weighted_tallies[new_pile] += ballot_weights[voter_num]
                 end
             end
-            break
+            ballot_pile_sizes[next_winner_index] = 0
+            print("\n\nFound winner $next_winner\n; winners so far: $winners_so_far of $n_winners\n; surviving_candidates = $(sum(surviving_candidates))\n\n")
+            round += 1
+            continue
+            
         end
 
         
         # No candidate has more votes than the quota, so eliminate the candidate with the fewest votes
         losing_survivor = argmin(weighted_tallies[surviving_candidates])
         loser_index = get_survivor_index(losing_survivor, surviving_candidates, n_candidates)
-        loser = deindexify(loser_index)
+        if distance_from_pivotality != nothing
+            second_to_last_tally = minimum(weighted_tallies[surviving_candidates .& (1:n_candidates .!= losing_survivor)])
+            distance_from_pivotality[1] = minimum(distance_from_pivotality[1],
+                    second_to_last_tally - weighted_tallies[losing_survivor])
+        end
+        loser = deindexify_(loser_index)
 
         # Record the round
         if record != nothing
@@ -233,7 +428,7 @@ function STV_result_inner!(election::Election,
         for i in 1:ballot_pile_sizes[loser_index]
             voter_num = ballot_piles[loser_index, i]
             ballot = get_ballot(election, voter_num)
-            new_pile = best_surviving_preference(ballot, surviving_candidates, n_candidates, indexify)
+            new_pile = best_surviving_preference(ballot, surviving_candidates, n_candidates, indexify_)
             if new_pile == 0
                 ballot_weights[voter_num] = 0.
             else
@@ -256,6 +451,8 @@ function STV_result_inner!(election::Election,
             @assert all(weighted_tallies[surviving_candidates] .<= ballot_pile_sizes[surviving_candidates])
         end
 
+        print("\n\nRound $round done\n; winners so far: $winners_so_far of $n_winners\n; surviving_candidates = $(sum(surviving_candidates))\n\n")
+        round += 1
     end
 
     #record winners
@@ -268,7 +465,7 @@ end
 
 # Helper functions
 
-function do_initial_tallies!(election::Election, 
+function do_initial_tallies!(election::AbstractElection, 
                 n_winners::Int, 
                 surviving_candidates::BitVector, 
                 winners::Vector{Int}, 
@@ -278,8 +475,8 @@ function do_initial_tallies!(election::Election,
                 ballot_pile_sizes::Vector{Int}, 
                 weighted_tallies::Vector{Float64}, 
                 ballot_weights::Vector{Float64})
-    n_voters = length(election.ballots)
-    n_candidates = election.n_candidates * 2 # Each candidate has a mirror anti-candidate. 
+    n_voters = count_voters(election)
+    n_candidates = count_candidates(election) * 2 # Each candidate has a mirror anti-candidate. 
         # The anti-candidate is the candidate with the same index, but with a negative sign.
         # If you're running a normal election, the anti-candidates will never win, so you can ignore them.
     indexify = cand_id_to_index(n_candidates) # Convert from candidate id (-n_candidates/2 to n_candidates/2) to candidate index (1 to n_candidates)
@@ -337,6 +534,30 @@ function get_ballot(election::ElectionWithMirrors, voter_num::Int)
     end
 end
 
+function get_ballot(election::ElectionOneMirror, voter_num::Int)
+    if election.inversions[voter_num]
+        return OneInversionPreferenceBallot(election.model.ballots[voter_num], election.cand_to_invert)
+    else
+        return election.model.ballots[voter_num]
+    end
+end
+
+function get_ballot(election::ElectionGlass, voter_num::Int) # no bang because I'm lazy and the side effect is just for efficiency
+    return view_ballot!(get_ballot(election.model, voter_num), election.glass, voter_num)
+end
+
+function view_ballot!(ballot::PreferenceBallot, glass::PermMirrors, voter_num::Int)
+    place_in_perm = glass.perm[voter_num]
+    if place_in_perm <= glass.how_deep
+        return InvertedPreferenceBallot(ballot)
+    else
+        if place_in_perm == glass.how_deep + 1
+            glass.index_of_first_unmirrored = voter_num
+        end
+        return ballot
+    end
+end
+
 function best_surviving_preference(ballot::PreferenceBallot, surviving_candidates::BitVector, n_candidates::Int, indexify::Function;
         dont_invert_ballot::Bool=true)
 """
@@ -383,8 +604,33 @@ function best_surviving_preference(ballot::InvertedPreferenceBallot, surviving_c
     return best_surviving_preference(ballot.model, surviving_candidates, n_candidates, indexify; dont_invert_ballot=false)
 end
 
+function best_surviving_preference(ballot::OneInversionPreferenceBallot, surviving_candidates::BitVector, n_candidates::Int, indexify::Function)
+    for candidate in ballot.model.preferences
+        if candidate == ballot.cand_to_invert
+            c = indexify(-candidate)
+        else
+            c = indexify(candidate)
+        end
+        if c!=0 && surviving_candidates[c]
+            return c 
+        end
+    end
+    # Now do the anti-candidates
+    for candidate in ballot.model.preferences[end:-1:1]
+        if candidate == ballot.cand_to_invert
+            c = indexify(candidate)
+        else
+            c = indexify(-candidate)
+        end
+        if c!=0 && surviving_candidates[c]
+            return c 
+        end
+    end
+    return 0
+end
+
 function cand_id_to_index(n_candidates::Int)
-    return function(cand_id::Int)
+    return function(cand_id::Int16)
         if cand_id > 0
             return cand_id
         else
@@ -398,7 +644,7 @@ function cand_index_to_id(n_real_candidates::Int)
         if cand_index <= n_real_candidates
             return cand_index
         else
-            return n_candidates - cand_index
+            return Int16(n_candidates - cand_index)
         end
     end
 end
@@ -438,11 +684,17 @@ function STV_result!(election::Election,
                 ballot_weights::Vector{Float64};
                 
                 assert_invariants::Bool=false,
-                record::Union{STV_record, Nothing}=nothing)
+                record::Union{STV_record, Nothing}=nothing,
+                deindexify::Union{Function, Nothing}=nothing,
+                indexify::Union{Function, Nothing}=nothing,
+                white_box_power::Union{Matrix{Float64}, Nothing}=nothing,
+                distance_from_pivotality::Union{Vector{Float64}, Nothing}=nothing)
     reinitialize_running_variables!(election, n_winners, surviving_candidates, winners, winners_so_far, round, ballot_piles, ballot_pile_sizes, weighted_tallies, ballot_weights)
     return STV_result_inner!(election, n_winners, surviving_candidates, winners, winners_so_far, 
             round, ballot_piles, ballot_pile_sizes, weighted_tallies, ballot_weights;
-            assert_invariants=assert_invariants, record=record)
+            assert_invariants=assert_invariants, record=record,
+            deindexify=deindexify, indexify=indexify, white_box_power=white_box_power, 
+            distance_from_pivotality=distance_from_pivotality)
 end
 
 # Functions to create random voters and elections
@@ -456,4 +708,416 @@ function random_STV_election(n_candidates::Int, n_voters::Int)
     return Election(n_candidates, ballots)
 end
 
+function random_preference_ballot(n_candidates::Int, prefers::Int)
+"""
+    Create a random preference ballot where the voter prefers a specific candidate.
+"""
+    remaining_prefs = setdiff(1:n_candidates, [prefers])
+    return PreferenceBallot([prefers; remaining_prefs[randperm(n_candidates-1)]])
 end
+
+function random_STV_election(n_candidates::Int, n_voters::Int, n_triangle_groups::Int)
+"""
+    Create a random STV election with a few groups, with relative sizes 1, 2, 3, ..., n_triangle_groups.
+    Each group should prefer the candidate with the same index. The remaining candidates are 
+    randomly ordered ONCE for the entire group.
+"""
+    @assert n_candidates >= n_triangle_groups
+    total_triangle_size = n_triangle_groups * (n_triangle_groups + 1) // 2
+    size_base = n_voters // total_triangle_size
+    size_remainder = n_voters - (total_triangle_size * size_base)
+    ballots = []
+    for i in 1:n_triangle_groups
+        ballot = random_preference_ballot(n_candidates, i)
+        for j in 1:(size_base * i)
+            push!(ballots, ballot)
+        end
+    end
+    for i in 1:size_remainder
+        # Draw a ballot from the existing ballots
+        ballot = ballots[rand(1:length(ballots))]
+        push!(ballots, ballot)
+    end
+    return Election(n_candidates, ballots)
+end
+
+# Functions for creating electorates of spatial voters 
+
+# Three possible ways to create a spatial electorate:
+# 1. Gaussian model of voters and candidates
+# 2. Dirichlet mixture model of (Gaussian clusters of) voters and candidates
+# 3. Hierarchical Dirichlet mixture model of voters and candidates. 
+#     That is to say, a tree, where each branch is a DMM and each leaf is a GM.
+
+# Option 1 is probably too simple, as it makes systemic Condorcet cycles impossible.
+# Option 3 is probably overkill — not in terms of the electorates it produces, but just 
+# in terms of the complexity to code the model. Basically, you'd need separate propagation and cutoff rules
+# for alpha, precision (inverse variance of GMMs), and dimension weights — and all of those would have parameters
+# that would need to be tuned (either a priori or empirically).
+
+# So let's code options 1 (as a simple example, and as a building block) and 2 (as a more realistic model).
+# That means that even though 2 could be seen as a special case of 3, we'll make types for 2 separately, 
+# then maybe do 3 later without worrying about the code/type duplication.
+
+# Still, even for option 2 (DMM), we'll need to decide how to propagate precision and weights. Sub-options:
+# A. Just use the same precision and weights for all subclusters. This is the simplest, but not realistic.
+#    In real life, different voter groups care about different issues differently.
+# B. Propagate precision and weights from the parent cluster to the subclusters, but allow them to change.
+#    But how? Let's see...:
+#    * Precision and weight on a given dimension are correlated. A group that cares a lot about a dimension
+#      (high weight) will also vary less on that dimension (high precision).
+#    * This will also correlate with squared deviance on that dimension. (Or is it better to use absolute deviance?)
+#    * But maybe we want a ceiling on the weight * deviance product, because otherwise we'll get groups that
+#      both extreme and picky, making our a priori dimension weights (and thus, the calculation of the effective
+#      number of dimensions of the electorate as a whole, and the dimension weight cutoffs) mean something quite 
+#      different from their naive interpretation.
+#    * I think the lesson here is that, assuming we're propagating using chi squared distributions, we should
+#      make sure the degrees of freedom aren't too low.
+# ...OK, so "simple" version of B is:
+# For a new cluster, draw standard normals A, B, C, D for each dimension. Position is A, precision (factor) is
+# sqrt(A²+B²+C²/3), and weight factor is sqrt(A²+B²+D²/3). (Thus, precision and weight are both from "chi" distributions with 3 df.)
+
+# Let's code that up. If we want to vary df, we can refactor later.
+
+abstract type SpatialGenerator end
+
+struct GaussianSpatialGenerator <: SpatialGenerator
+    center::Vector{Float64}
+    precision::Vector{Float64} # sqrt diagonal of precision matrix (inverse stdev)
+    weights::Vector{Float64} # dimension weights (diagonal of precision for mahalanobis distance metric)
+end
+
+mutable struct DirichletSpatialGenerator <: SpatialGenerator
+    subclusters::Vector{GaussianSpatialGenerator}
+    cluster_sizes::Vector{Float64} #in practice, ints; but since we'll be adding alpha in use, store 'em as floats 
+    dim_weights::Vector{Float64}
+    dim_weight_factor::Float64 # for auditing only — once we have the weights, this is redundant
+    dim_weight_cutoff::Float64 # for auditing only — once we have the weights, this is redundant
+    alpha::Float64
+    precision_factor::Float64 # cluster precision is sqrt(chi²/df) * precision_factor * master_precision (master_precision is 1 for non-hierarchical)
+    # DF & correlations for propagating precision and weight heirarchically would go here. Not sure how I'd even parametrize that.
+end
+
+
+function DirichletSpatialGenerator(dim_weight_factor::Float64, dim_weight_cutoff::Float64, alpha::Float64, precision_factor::Float64)
+    """
+    Set up a Dirichlet mixture model of spatial voters. Later we can draw from it to get voters and candidates
+    for an electorate.
+    """
+    @assert 0 < dim_weight_factor < 1
+    @assert 0 < dim_weight_cutoff < 1
+    @assert alpha > 0
+
+    dim_weights = [1.]
+    df = 1.5
+    while true
+        next_dim_weight = (dim_weights[end] * dim_weight_factor * 
+            # chi-squared distribution with df degrees of freedom, normalized
+            rand(Chisq(df)) / df)
+        if (next_dim_weight / sum(dim_weights)) < dim_weight_cutoff # note that d_w_c is in terms of odds
+            break
+        end
+        push!(dim_weights, next_dim_weight)
+    end
+    return DirichletSpatialGenerator([], [], dim_weights, dim_weight_factor, dim_weight_cutoff, precision_factor, alpha)
+
+end
+
+function draw_voter!(generator::GaussianSpatialGenerator, label::Any) # bang because generally this function could modify the generator, even though this version doesn't
+    return SpatialVoter(generator.center + rand(Normal(0., 1.), length(generator.center)) ./ (generator.precision),
+        generator.weights, label)
+end
+
+function draw_voter!(generator::GaussianSpatialGenerator)
+    return draw_voter!(generator, nothing)
+end
+
+function draw_voter!(generator::DirichletSpatialGenerator)
+    probs = vcat(generator.cluster_sizes, [generator.alpha])
+    subcluster = rand(Categorical(probs / sum(probs)))
+    if subcluster > length(generator.subclusters)
+        @assert subcluster == length(generator.subclusters) + 1
+        # Draw a new subcluster
+        rands = randn(length(generator.dim_weights), 4) # 4 rands for A, B, C, D 
+        center = rands[:, 1]
+        precision = (sum(rands[:, 1:3].^2, dims=2) * generator.precision_factor / 3)
+        weights = sqrt.(sum(rands[:, [1, 2, 4]].^2, dims=2) / 3) .* generator.dim_weights
+        println("New subcluster: center $center, precision $precision, weights $weights")
+        push!(generator.subclusters, GaussianSpatialGenerator(center, vec(precision), vec(weights)))
+        push!(generator.cluster_sizes, 1.)
+    else
+        generator.cluster_sizes[subcluster] += 1.
+    end
+    return draw_voter!(generator.subclusters[subcluster], subcluster)
+end
+
+function draw_electorate!(generator::SpatialGenerator, n_voters::Int, n_candidates::Int)
+    voters = [draw_voter!(generator) for i in 1:n_voters]
+    candidates = [draw_voter!(generator) for i in 1:n_candidates]
+    return Electorate(voters, candidates)
+end
+
+function plot_electorate(electorate::Electorate)
+    # Plot the first two dimensions of the voters, color coded by cluster
+    scatter([voter.location[1] for voter in electorate.voters], [voter.location[2] for voter in electorate.voters], 
+        group=[voter.label for voter in electorate.voters],
+        title="Voters",
+        xlabel="Dimension 1",
+        ylabel="Dimension 2 $(mean([voter.weights[2] for voter in electorate.voters]))",
+        # semitransparent
+        markersize=3, markerstrokewidth=0, markeralpha=0.1)
+
+end
+
+# Functions for getting voter power (in the sense of black-box or mirror-universe power). For now let's call this BBVP.
+
+# BBVP is defined as the probability that a voter is pivotal for a given candidate, under the "mirror universe distribution"
+# of elections, minus the probability that they're anti-pivotal, times the number of voters. By construction, the sum of BBVPs
+# for a given candidate is 1. (This is because basic assumptions about the voting system imply that a winner of the actual
+# election will not win a fully-mirrored election; thus, for any permutation, the number of pivotal voters minus the number of
+# anti-pivotal voters is 1.)
+
+# To generate the mirror universe distribution,
+# 1. Take the actual election as it occurred.
+# 2. Take a random permutation of the voters.
+# 3. Take a uniformly random fraction of the voters and mirror up to that fraction in order of the permutation.
+
+# A voter is pivotal under this distribution if they are the next voter to be mirrored, AND if mirroring them would cause
+# the given candidate not to win. (If the candidate is already not winning, the voter is not pivotal.)
+# Anti-pivotality is defined similarly, but causing them to win.
+
+# (OK this definition is problematic because the draw from the mirror universe distribution yields not just an election, but
+# also a "next voter" to check. Pretty sure it's possible to rewrite this to something clean and equivalent but that's not
+# the point right now.)
+
+# Estimating a given voter's BBVP by naive brute-force sampling is infeasible (it's O((V+1)!), where V is the number of 
+# voters) so we need to take advantage of
+# symmetries. In particular, when we use a specific permutation to find a pivotal voter, we can find all voters who are
+# equivalent to that voter in terms of pivotality; that is, who would be pivotal under a permutation that swaps them with
+# the pivotal voter. This will generally be approximately V/C voters, where C is the number of candidates. This speeds things
+# up by a factor of (almost) V/C because we're effectively finding pivotality for V/C different permutations at once.
+
+# (Actually, "equivalency" here could be defined in two ways: either the simple definition above, or "weighted equivalency",
+# where we look for voters who are "pulling in the same direction", then weight by "how far they're pulling". These are
+# asymptotically the same; "weighted equivalency" is a bit more efficient, but "simple equivalency" is slightly more correct 
+# in small samples.)
+
+# Still, we're never going to exhaustively search all permutations, so any measure of BBVP will be an estimate (with an estimated
+# error). We can reduce the error by taking more samples, but that's about it.
+
+# So the key functions will be:
+# sample_a_pivotal_voter_for: find *a* pivotal voter for one random permutation. Note that this uses binary search, so it's
+#      essentially assuming that there's no anti-pivotal voters (thus, only one pivotal voter). 
+#      This assumption should almost entirely hold for STV. Insofar as it doesn't,
+#      this will bias things slightly in a way I haven't worked out yet.
+# find_equivalent_voters: find all voters who are equivalent to a given voter in terms of pivotality.
+#      (takes a flag for "weighted equivalency" or not)
+# sample_one_BBVP: use the two above to calculate the BBVP contribution for that one permutation and equivalents.
+#      (takes a flag for "weighted equivalency" or not)
+# estimate_BBVP: get estimated_BBVP (and its error) for all voters for a given candidate, by looping over sample_one_BBVP and averaging.
+# estimate_all_BBVPs: get estimate_BBVPs for all winning candidates (in a matrix)
+
+function sample_a_pivotal_voter_for(election::Election, n_winners::Int, winner_index::Int, get_winners::Function)
+    """
+    Given an election and a (mirror-free) winner of that election, use a permutation of the voters to find 
+    a voter who is pivotal for that winner as you mirror the voters in that permuted order.
+
+    Uses binary search
+    """
+    n_voters = length(election.ballots)
+    
+    # Make an ElectionGlass of the election, with a random permutation
+    perm = randperm(n_voters)
+    glass = PermMirrors(perm, n_voters // 2, -1)
+    election_glass = ElectionGlass(election, glass)
+
+    min_is_elected = 0
+    max_isnt_elected = n_voters
+    possible_pivot = -1
+    while max_isnt_elected - min_is_elected > 1
+        mid = (max_isnt_elected + min_is_elected) // 2
+        # set the depth of the glass
+        glass.how_deep = mid
+        #clear index_of_first_unmirrored
+        glass.index_of_first_unmirrored = -1
+        winners = get_winners(election_glass, n_winners) #side effect: sets index_of_first_unmirrored
+        if winner_index in winners
+            max_isnt_elected = mid
+        else
+            min_is_elected = mid
+            possible_pivot = glass.index_of_first_unmirrored
+        end
+    end
+
+    @assert possible_pivot != -1
+    glass.how_deep = min_is_elected
+    return (possible_pivot, election_glass) # return the glass so we can find equivalent voters
+end
+
+function find_equivalent_voters(voter_num::Int, election_glass::ElectionGlass, record::STV_record; 
+    weighted::Bool=false, quota::Float64=0., debug::Bool=false)
+    """
+    Given a voter number, an ElectionGlass, and a STV_record, give a vector of equivalencies to that voter, normalized to sum to 1.
+    """
+    model = election_glass.model
+
+    pivotal_rounds = Vector{Int}()
+    current_weight_by_pivotal_round = Vector{Float64}()
+    ballot_pile_by_pivotal_round = Vector{Int}()
+    base_ballot = get_ballot(election_glass, voter_num)
+    if quota == 0.
+        quota = get_quota(record)
+
+    current_weight = get_ballot_weight(model, voter_num)
+    # Find the rounds in which the given voter is pivotal, and the remaining weight of the voter in those rounds
+    for i in 1:length(record.rounds)
+        if debug
+            println("Round $i")
+        end
+        round = record.rounds[i]
+        ballot_pile = best_surviving_preference(base_ballot, round.surviving_candidates, length(round.surviving_candidates), indexify_)
+        if ballot_pile == 0
+            # The voter's ballot is not in the surviving candidates
+            if debug
+                println("   Voter $voter_num has no surviving candidates")
+            end
+            continue
+        end
+        if round.winner_found
+            if debug 
+                println("   Winner found: $(round.reallocated_cand); ballot pile $ballot_pile")
+            end
+            if ballot_pile == round.reallocated_cand
+                if debug
+                    println("   Voter $voter_num is in the winning candidate's pile")
+                end
+                # The voter's ballot is in the winning candidate's pile
+                
+                # Thus, the ballot is pivotal iff the difference between the winning tally and the 
+                # second-place tally is less than the voter's weight, OR if those are equal and the 
+                # second-place index is less than the winner's index.
+                second_place_tally = maximum(round.weighted_tallies[
+                    round.surviving_candidates .& (round.surviving_candidates .!= round.reallocated_cand)])
+                if round.weighted_tallies[round.reallocated_cand] - second_place_tally < current_weight
+                    push!(pivotal_rounds, i)
+                    push!(current_weight_by_pivotal_round, current_weight)
+                    push!(ballot_pile_by_pivotal_round, ballot_pile)
+                    if debug
+                        println("   Voter $voter_num is pivotal in round $i: weight $current_weight, second place $second_place_tally, winner tally $(round.weighted_tallies[round.reallocated_cand])")
+                    end
+                elseif round.weighted_tallies[round.reallocated_cand] - second_place_tally == current_weight
+                    second_place_index = argmax(round.weighted_tallies[
+                        round.surviving_candidates .& (round.surviving_candidates .!= round.reallocated_cand)])
+                    if second_place_index < round.reallocated_cand
+                        push!(pivotal_rounds, i)
+                        push!(current_weight_by_pivotal_round, current_weight)
+                        push!(ballot_pile_by_pivotal_round, ballot_pile)
+                        if debug
+                            println("   Voter $voter_num is barely pivotal in round $i: weight $current_weight, second place $second_place_tally, winner tally $(round.weighted_tallies[round.reallocated_cand])")
+                        end
+                    end
+                end
+            end
+
+            #reweight for next round
+            winner_tally = round.weighted_tallies[round.reallocated_cand]
+            current_weight = current_weight * winner_tally / (winner_tally - quota)
+
+        else # not round.winner_found, so elimination round
+            #the ballot is pivotal iff 
+            #   * the voter's ballot is in the second-to-last pile AND
+            #       * the difference between the second-to-last tally and the last tally is less than the voter's weight OR
+            #       * those are equal and the last index is less than the second-to-last index
+
+            surviving_second_to_last = argmin(round.weighted_tallies[
+                round.surviving_candidates .& (round.surviving_candidates .!= round.reallocated_cand)])
+            second_to_last = get_survivor_index(surviving_second_to_last, round.surviving_candidates, length(round.surviving_candidates))
+            if debug
+                println("   Second to last: $second_to_last; ballot pile $ballot_pile")
+            end
+            if ballot_pile == second_to_last
+                second_to_last_tally = round.weighted_tallies[second_to_last]
+                if second_to_last_tally - round.weighted_tallies[round.reallocated_cand] < current_weight
+                    push!(pivotal_rounds, i)
+                    push!(current_weight_by_pivotal_round, current_weight)
+                    push!(ballot_pile_by_pivotal_round, ballot_pile)
+                    if debug
+                        println("   Voter $voter_num is pivotal in round $i: weight $current_weight, second to last $second_to_last_tally, last tally $(round.weighted_tallies[round.reallocated_cand])")
+                    end
+                elseif second_to_last_tally - round.weighted_tallies[round.reallocated_cand] == current_weight
+                    if round.reallocated_cand < second_to_last
+                        push!(pivotal_rounds, i)
+                        push!(current_weight_by_pivotal_round, current_weight)
+                        push!(ballot_pile_by_pivotal_round, ballot_pile)
+                        if debug
+                            println("   Voter $voter_num is barely pivotal in round $i: weight $current_weight, second to last $second_to_last_tally, last tally $(round.weighted_tallies[round.reallocated_cand])")
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if length(pivotal_rounds) == 0
+        raise("Voter $voter_num is not pivotal in any round")
+    end
+    # Now we have the pivotal rounds and the weights in those rounds. For each other ballot, 
+    # we can see if it agrees with the voter in those rounds. If so, then check its weight in those rounds.
+    # If weighted is true, then weight by the weight in that round. 
+    # Otherwise, weight is 1 iff its weight in that round >= the voter's weight then, 0 otherwise.
+
+    equivalent_voters = zeros(Float64, length(model.ballots))
+    for i in 1:length(model.ballots)
+        if i == voter_num
+            equivalent_voters[i] = 1.
+            continue
+        end
+        ballot = get_ballot(model, i)
+        possible_pivotal_rounds = Vector{Int}()
+        for j in 1:length(pivotal_rounds)
+            round = pivotal_rounds[j]
+            ballot_pile = best_surviving_preference(ballot, record.rounds[round].surviving_candidates, length(record.rounds[round].surviving_candidates), indexify_)
+            if ballot_pile == 0
+                continue
+            end
+            if ballot_pile == ballot_pile_by_pivotal_round[j]
+                possible_pivotal_rounds = push!(possible_pivotal_rounds, round)
+            end
+        end
+
+        if length(possible_pivotal_rounds) == 0
+            continue
+        end
+        weight = get_ballot_weight(model, i)
+        for round in 1:length(record.rounds)
+            if round in possible_pivotal_rounds
+                if weighted
+                    equivalent_voters[i] += weight / current_weight_by_pivotal_round[findfirst(possible_pivotal_rounds, round)] * weight
+                else
+                    if weight >= current_weight_by_pivotal_round[findfirst(possible_pivotal_rounds, round)]
+                        equivalent_voters[i] += 1.
+                    end
+                end
+            end
+            if record.rounds[round].winner_found
+                ballot_pile = best_surviving_preference(ballot, record.rounds[round].surviving_candidates, length(record.rounds[round].surviving_candidates), indexify_)
+                if ballot_pile == record.rounds[round].reallocated_cand
+                    winner_tally = record.rounds[round].weighted_tallies[record.rounds[round].reallocated_cand]
+                    weight = weight * winner_tally / (winner_tally - quota)
+                end
+            end
+        end
+    end
+
+    # Normalize
+    equivalent_voters = equivalent_voters / sum(equivalent_voters)
+
+    return equivalent_voters
+
+end
+
+function hello_world()
+    println("Hello, world!")
+end
+
+end # module
